@@ -2,6 +2,7 @@
 {% load i18n %}
 {% load bootstrap3 %}
 {% load static %}
+{% load tz %}
 
 {% block custom_header %}
   {{ block.super }}
@@ -148,6 +149,18 @@
                         <span class='label label-success'>{% trans 'Claimed' %}</span>
                       {% elif va.status == 'sent' %}
                         <span class='label label-info'>{% trans 'Sent — not claimed' %}</span>
+                        {% if va.sent_at %}
+                          {% timezone request.event.timezone %}
+                            {% now 'Y' as current_year %}
+                            <small class='text-muted ts-voucher-sent-date' title='{{ va.sent_at|date:"j M Y H:i T" }}' data-toggle='tooltip'>
+                              {% if va.sent_at|date:'Y' == current_year %}
+                                {% blocktrans trimmed with sent=va.sent_at|date:'j M' %}Sent {{ sent }}{% endblocktrans %}
+                              {% else %}
+                                {% blocktrans trimmed with sent=va.sent_at|date:'j M Y' %}Sent {{ sent }}{% endblocktrans %}
+                              {% endif %}
+                            </small>
+                          {% endtimezone %}
+                        {% endif %}
                       {% else %}
                         <span class='label label-default'>{% trans 'Not sent' %}</span>
                       {% endif %}
