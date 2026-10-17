@@ -2,6 +2,7 @@ import json
 from datetime import timedelta
 
 import pytest
+from django.db import IntegrityError
 from django.urls import reverse
 from django.utils.timezone import now
 from django_scopes import scope
@@ -262,4 +263,143 @@ def test_unchanged_unmanaged_roles_keep_their_identity(role_setup, endpoint):
         content_type="application/json",
     )
     assert response.status_code == 200
+    assert_protected(role_setup)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("endpoint", ["api_shift_detail", "public_shift_manage"])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_numeric_string_role_ids_are_editable(role_setup, endpoint, legacy):
+    client, event, shift, allowed, *_ = role_setup
+    payload = {"role": str(allowed.pk), "capacity": "4"} if legacy else {"roles": [{"id": str(allowed.pk), "capacity": "4"}]}
+    response = client.patch(url(event, endpoint, shift), data=json.dumps(payload), content_type="application/json")
+    assert response.status_code == 200
+    with scope(event=event):
+        assert shift.role_assignments.get(role=allowed).capacity == 4
+    assert_protected(role_setup)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("endpoint", ["api_shift_detail", "public_shift_manage"])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_numeric_string_protected_roles_stay_unchanged(role_setup, endpoint, legacy):
+    client, event, shift, allowed, protected, *_ = role_setup
+    payload = (
+        {"role": str(protected.pk), "capacity": "3"}
+        if legacy
+        else {"roles": [{"id": str(allowed.pk), "capacity": "4"}, {"id": str(protected.pk), "capacity": "3"}]}
+    )
+    response = client.patch(url(event, endpoint, shift), data=json.dumps(payload), content_type="application/json")
+    assert response.status_code == 200
+    assert_protected(role_setup)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("endpoint", ["api_shift_detail", "public_shift_manage"])
+def test_numeric_string_ids_do_not_allow_protected_changes(role_setup, endpoint):
+    client, event, shift, _, protected, *_ = role_setup
+    payload = {"title": "Must not change", "roles": [{"id": str(protected.pk), "capacity": "9"}]}
+    response = client.patch(url(event, endpoint, shift), data=json.dumps(payload), content_type="application/json")
+    assert response.status_code == 403
+    with scope(event=event):
+        shift.refresh_from_db()
+        assert shift.name == "Morning"
+    assert_protected(role_setup)
+
+
+@pytest.mark.django_db
+def test_api_create_accepts_numeric_string_role_id(role_setup):
+    client, event, shift, allowed, *_ = role_setup
+    payload = {"start": shift.start_time.isoformat(), "end": shift.end_time.isoformat(), "roles": [{"id": str(allowed.pk), "capacity": "4"}]}
+    response = client.post(url(event, "api_shifts"), data=json.dumps(payload), content_type="application/json")
+    assert response.status_code == 200
+    with scope(event=event):
+        assert ShiftRoleAssignment.objects.get(shift_id=response.json()["id"]).capacity == 4
+    assert_protected(role_setup)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("endpoint", ["api_shifts", "api_shift_detail", "public_shift_manage"])
+def test_duplicate_role_insert_rolls_back_shift_changes(role_setup, endpoint):
+    client, event, shift, allowed, _, editable, *_ = role_setup
+    payload = {"title": "Must not persist", "roles": [{"id": allowed.pk, "capacity": 4}, {"id": allowed.pk, "capacity": 5}]}
+    if endpoint == "api_shifts":
+        payload.update(start=shift.start_time.isoformat(), end=shift.end_time.isoformat())
+        operation = client.post
+        target = url(event, endpoint)
+    else:
+        operation = client.patch
+        target = url(event, endpoint, shift)
+    with pytest.raises(IntegrityError):
+        operation(target, data=json.dumps(payload), content_type="application/json")
+    with scope(event=event):
+        assert list(Shift.objects.values_list("pk", flat=True)) == [shift.pk]
+        shift.refresh_from_db()
+        editable.refresh_from_db()
+        assert shift.name == "Morning"
+        assert editable.capacity == 2
+    assert_protected(role_setup)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("endpoint", "legacy"),
+    [("api_shifts", False), ("api_shift_detail", False), ("public_shift_manage", False), ("api_shift_detail", True), ("public_shift_manage", True)],
+)
+def test_failed_role_insert_rolls_back_shift_changes(role_setup, endpoint, legacy, monkeypatch):
+    client, event, shift, allowed, _, editable, *_ = role_setup
+    with scope(event=event):
+        volunteer = User.objects.create_user(email="registration@example.com", password="secret")
+        assignment = ShiftAssignment.objects.create(shift=shift, role=allowed, team_member=volunteer)
+    payload = {"title": "Must not persist"}
+    if legacy:
+        payload.update(role=allowed.pk, capacity=4)
+    else:
+        payload["roles"] = [{"id": allowed.pk, "capacity": 4}]
+    if endpoint == "api_shifts":
+        payload.update(start=shift.start_time.isoformat(), end=shift.end_time.isoformat())
+        operation = client.post
+        target = url(event, endpoint)
+    else:
+        operation = client.patch
+        target = url(event, endpoint, shift)
+
+    def fail_insert(**kwargs):
+        raise IntegrityError("Simulated concurrent assignment insert conflict")
+
+    monkeypatch.setattr(ShiftRoleAssignment.objects, "create", fail_insert)
+    with pytest.raises(IntegrityError):
+        operation(target, data=json.dumps(payload), content_type="application/json")
+    with scope(event=event):
+        assert list(Shift.objects.values_list("pk", flat=True)) == [shift.pk]
+        shift.refresh_from_db()
+        editable.refresh_from_db()
+        assert shift.name == "Morning"
+        assert editable.capacity == 2
+        assert ShiftAssignment.objects.filter(pk=assignment.pk).exists()
+    assert_protected(role_setup)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("endpoint", ["api_shifts", "api_shift_detail", "public_shift_manage"])
+def test_invalid_role_does_not_persist_metadata_or_shift(role_setup, endpoint):
+    client, event, shift, _, _, editable, _, _, team = role_setup
+    team.all_teamshifts_roles = True
+    team.save(update_fields=["all_teamshifts_roles"])
+    payload = {"title": "Must not persist", "roles": [{"id": 999999999, "capacity": 1}]}
+    if endpoint == "api_shifts":
+        payload.update(start=shift.start_time.isoformat(), end=shift.end_time.isoformat())
+        operation = client.post
+        target = url(event, endpoint)
+    else:
+        operation = client.patch
+        target = url(event, endpoint, shift)
+    response = operation(target, data=json.dumps(payload), content_type="application/json")
+    assert response.status_code == 400
+    with scope(event=event):
+        assert list(Shift.objects.values_list("pk", flat=True)) == [shift.pk]
+        shift.refresh_from_db()
+        editable.refresh_from_db()
+        assert shift.name == "Morning"
+        assert editable.capacity == 2
     assert_protected(role_setup)

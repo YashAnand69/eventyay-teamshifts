@@ -1654,13 +1654,24 @@ def _shift_role_form_kwargs(request):
     return {"event": request.event, "allowed_role_ids": get_allowed_role_ids(request.user, request.organizer, request.event, request=request)}
 
 
+def _normalize_shift_role_number(value):
+    # Django accepts integer strings, but IDs must not be truncated from floats.
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            pass
+    return value
+
+
 def _check_shift_role_changes(request, roles, shift=None):
     allowed = get_allowed_role_ids(request.user, request.organizer, request.event, request=request)
     if allowed is not None:
+        allowed = {_normalize_shift_role_number(role_id) for role_id in allowed}
         existing = dict(shift.role_assignments.values_list("role_id", "capacity")) if shift else {}
         for role in roles:
-            role_id = role.get("id")
-            if role_id and role_id not in allowed and existing.get(role_id) != role.get("capacity", 1):
+            role_id = _normalize_shift_role_number(role.get("id"))
+            if role_id and role_id not in allowed and existing.get(role_id) != _normalize_shift_role_number(role.get("capacity", 1)):
                 raise PermissionDenied(_("You do not have permission to manage this role."))
     return allowed
 
@@ -2274,7 +2285,7 @@ class ShiftScheduleTalksAPIView(PluginActiveMixin, TeamShiftsPermissionRequiredM
         except (UnicodeDecodeError, json.JSONDecodeError):
             return HttpResponseBadRequest("Invalid JSON body.")
         event = request.event
-        with scope(event=event):
+        with scope(event=event), transaction.atomic():
             if not data.get("start") or not data.get("end"):
                 return HttpResponseBadRequest("Both 'start' and 'end' are required.")
             try:
@@ -2299,6 +2310,15 @@ class ShiftScheduleTalksAPIView(PluginActiveMixin, TeamShiftsPermissionRequiredM
                 shift_name = "Shift"
 
             _check_shift_role_changes(request, data.get("roles", []))
+            roles = []
+            for role_data in data.get("roles", []):
+                role_id = _normalize_shift_role_number(role_data.get("id"))
+                if role_id:
+                    role = TeamRole.objects.filter(pk=role_id, event=event).first()
+                    if not role:
+                        return HttpResponseBadRequest("Role ID does not belong to this event.")
+                    roles.append((role, role_data.get("capacity", 1)))
+
             shift = Shift.objects.create(
                 event=event,
                 name=shift_name,
@@ -2308,14 +2328,8 @@ class ShiftScheduleTalksAPIView(PluginActiveMixin, TeamShiftsPermissionRequiredM
                 end_time=end,
             )
 
-            for role_data in data.get("roles", []):
-                role_id = role_data.get("id")
-                capacity = role_data.get("capacity", 1)
-                if role_id:
-                    role = TeamRole.objects.filter(pk=role_id, event=event).first()
-                    if not role:
-                        return HttpResponseBadRequest("Role ID does not belong to this event.")
-                    ShiftRoleAssignment.objects.create(shift=shift, role=role, capacity=capacity)
+            for role, capacity in roles:
+                ShiftRoleAssignment.objects.create(shift=shift, role=role, capacity=capacity)
 
             return JsonResponse({"id": shift.id})
 
@@ -2329,12 +2343,26 @@ class ShiftScheduleTalkAPIView(PluginActiveMixin, TeamShiftsPermissionRequiredMi
         except (UnicodeDecodeError, json.JSONDecodeError):
             return HttpResponseBadRequest("Invalid JSON body.")
         event = request.event
-        with scope(event=event):
+        with scope(event=event), transaction.atomic():
             shift = get_object_or_404(Shift, pk=kwargs["pk"], event=event)
             if "roles" in data:
                 allowed = _check_shift_role_changes(request, data["roles"], shift)
+                incoming_role_ids = set()
+                for role_data in data["roles"]:
+                    role_id = _normalize_shift_role_number(role_data.get("id"))
+                    if role_id:
+                        incoming_role_ids.add(role_id)
+                valid_roles = TeamRole.objects.filter(pk__in=incoming_role_ids, event=event)
+                valid_role_ids = set(valid_roles.values_list("pk", flat=True))
+                invalid_ids = incoming_role_ids - valid_role_ids
+                if invalid_ids:
+                    return HttpResponseBadRequest("One or more role IDs do not belong to this event.")
             elif "role" in data and "capacity" in data:
                 allowed = _check_shift_role_changes(request, [{"id": data["role"], "capacity": data["capacity"]}], shift)
+                role_id = _normalize_shift_role_number(data["role"])
+                if role_id:
+                    if not TeamRole.objects.filter(pk=role_id, event=event).exists():
+                        return HttpResponseBadRequest("Role ID does not belong to this event.")
             else:
                 allowed = None
 
@@ -2372,16 +2400,6 @@ class ShiftScheduleTalkAPIView(PluginActiveMixin, TeamShiftsPermissionRequiredMi
             shift.save()
 
             if "roles" in data:
-                incoming_role_ids = set()
-                for role_data in data["roles"]:
-                    role_id = role_data.get("id")
-                    if role_id:
-                        incoming_role_ids.add(role_id)
-                valid_roles = TeamRole.objects.filter(pk__in=incoming_role_ids, event=event)
-                valid_role_ids = set(valid_roles.values_list("pk", flat=True))
-                invalid_ids = incoming_role_ids - valid_role_ids
-                if invalid_ids:
-                    return HttpResponseBadRequest("One or more role IDs do not belong to this event.")
                 assignments = shift.assignments.exclude(role_id__in=incoming_role_ids)
                 role_assignments = shift.role_assignments.all()
                 if allowed is not None:
@@ -2390,15 +2408,11 @@ class ShiftScheduleTalkAPIView(PluginActiveMixin, TeamShiftsPermissionRequiredMi
                 assignments.delete()
                 role_assignments.delete()
                 for role_data in data["roles"]:
-                    role_id = role_data.get("id")
+                    role_id = _normalize_shift_role_number(role_data.get("id"))
                     capacity = role_data.get("capacity", 1)
                     if role_id and (allowed is None or role_id in allowed):
                         ShiftRoleAssignment.objects.create(shift=shift, role_id=role_id, capacity=capacity)
             elif "role" in data and "capacity" in data:
-                role_id = data["role"]
-                if role_id:
-                    if not TeamRole.objects.filter(pk=role_id, event=event).exists():
-                        return HttpResponseBadRequest("Role ID does not belong to this event.")
                 assignments = shift.assignments.exclude(role_id=role_id) if role_id else shift.assignments.all()
                 role_assignments = shift.role_assignments.all()
                 if allowed is not None:
