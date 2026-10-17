@@ -403,3 +403,30 @@ def test_invalid_role_does_not_persist_metadata_or_shift(role_setup, endpoint):
         assert shift.name == "Morning"
         assert editable.capacity == 2
     assert_protected(role_setup)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("endpoint", ["api_shifts", "api_shift_detail", "public_shift_manage"])
+def test_null_capacity_cannot_add_an_unmanaged_role(role_setup, endpoint):
+    client, event, shift, _, _, editable, *_ = role_setup
+    with scope(event=event):
+        unmanaged = TeamRole.objects.create(event=event, name="Catering")
+    payload = {"title": "Must not change", "roles": [{"id": unmanaged.pk, "capacity": None}]}
+    if endpoint == "api_shifts":
+        payload.update(start=shift.start_time.isoformat(), end=shift.end_time.isoformat())
+        operation = client.post
+        target = url(event, endpoint)
+    else:
+        operation = client.patch
+        target = url(event, endpoint, shift)
+    client.raise_request_exception = False
+    response = operation(target, data=json.dumps(payload), content_type="application/json")
+    assert response.status_code == 403
+    with scope(event=event):
+        assert list(Shift.objects.values_list("pk", flat=True)) == [shift.pk]
+        shift.refresh_from_db()
+        editable.refresh_from_db()
+        assert shift.name == "Morning"
+        assert editable.capacity == 2
+        assert not ShiftRoleAssignment.objects.filter(role=unmanaged).exists()
+    assert_protected(role_setup)

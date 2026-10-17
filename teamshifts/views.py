@@ -1671,7 +1671,7 @@ def _check_shift_role_changes(request, roles, shift=None):
         existing = dict(shift.role_assignments.values_list("role_id", "capacity")) if shift else {}
         for role in roles:
             role_id = _normalize_shift_role_number(role.get("id"))
-            if role_id and role_id not in allowed and existing.get(role_id) != _normalize_shift_role_number(role.get("capacity", 1)):
+            if role_id and role_id not in allowed and (role_id not in existing or existing[role_id] != _normalize_shift_role_number(role.get("capacity", 1))):
                 raise PermissionDenied(_("You do not have permission to manage this role."))
     return allowed
 
